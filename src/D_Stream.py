@@ -4,7 +4,51 @@ import numpy as np
 import math
 from collections import defaultdict
 import networkx as nx
+import torch
 from dataset.Slinding_window import process_streaming_data
+from sklearn.neighbors import BallTree
+
+import torch
+from collections import defaultdict
+
+
+def extract_torch_vectors_and_clusters_from_dstream(stream, vectors_np):
+    """
+    将 DStream 聚类器的结果转换为：
+    - vectors_torch: List[torch.Tensor]  按索引排序的所有向量
+    - clusters: List[List[int]]          每个聚类包含的向量索引
+
+    参数：
+    - stream: AngleGridDStream 实例
+    - vectors_np: List[np.ndarray] 所有向量
+
+    返回：
+    - vectors_torch: List[torch.Tensor]
+    - clusters: List[List[int]]
+    """
+    vector_to_gid = {}
+    gid_to_indices = defaultdict(list)
+
+    for idx, vec in enumerate(vectors_np):
+        gid = stream._assign_grid(vec)
+        if gid is not None:
+            vector_to_gid[idx] = gid
+            gid_to_indices[gid].append(idx)
+
+    # 获取当前 grid 的连接图（聚类结果）
+    active_clusters = stream.cluster()  # List[Set[gid]]
+    clusters = []
+    for cluster in active_clusters:
+        merged = []
+        for gid in cluster:
+            merged.extend(gid_to_indices.get(gid, []))
+        if merged:
+            clusters.append(merged)
+
+    # 构造 torch.Tensor 形式的 vectors（按索引顺序排列）
+    vectors_torch = [torch.tensor(vec, dtype=torch.float32) for vec in vectors_np]
+
+    return vectors_torch, clusters
 
 
 def angular_distance(u, v):
@@ -12,7 +56,7 @@ def angular_distance(u, v):
     return math.acos(cosine)
 
 
-def sample_direction_centers(theta, dim=100, max_centers=2000):
+def sample_direction_centers(theta, dim=100, max_centers=100):
     centers = []
     first = np.random.randn(dim)
     first /= np.linalg.norm(first)
@@ -154,7 +198,7 @@ class AngleGridDStream:
         self.dim = dim
         # 采样 centers
         self.centers = safe_sample_direction_centers(theta, dim)
-        # print(f"采样完成，生成 center 数量: {len(self.centers)}")
+        print(f"采样完成，生成 center 数量: {len(self.centers)}")
         self.grid_density = defaultdict(float)
         self.grid_last_updated = {}
 
@@ -207,7 +251,77 @@ class AngleGridDStream:
         clusters = list(nx.connected_components(G))
         return clusters
 
+
 def DStream(windows_updates, vectors, theta, window_num):
+    """
+    对于每个Streaming vectors，执行完整的Naive插入和删除
+    :param windows_updates:
+    :return:
+    """
+    clusters = []  # 多个index list组成，每个list代表一个cluster
+    time_each_window = []
+    vector_to_cluster = {}  # 每个vector对应的cluster_id
+
+    initial_start = time.time()
+    # 再添加
+    stream = AngleGridDStream(theta=np.deg2rad(theta), decay_lambda=0.001, dense_thresh=3, sparse_thresh=0.5,
+                              dim=len(vectors[0]))
+    initial_end = time.time()
+    initial_time = initial_end - initial_start
+
+    for window_index, updates in windows_updates.items():
+        if window_index >= window_num:
+            break
+        print(f"Processing updates for window {window_index}")
+        updated_vectors = {}  # 在这个window变化的向量
+        updated_vector_index = set()
+        # 记录上一个没更新之前的向量
+        # vectors_last = vectors
+
+        # updates 是一个 DataFrame，且包含需要的更新信息
+        for _, update in updates.iterrows():
+            row = update['row_index']  # 需要更新的向量索引
+            col = update['col_index']  # 需要更新的维度索引
+            behave = update['behave']  # 过期/新增
+
+            # 如果新增
+            if behave == 1:
+                vectors[row][col] += 1
+
+            elif behave == -1:  # 如果过期，一定在范围内
+                vectors[row][col] -= 1
+
+            updated_vector_index.add(row)
+
+        t1 = time.time()
+        for row in updated_vector_index:
+            updated_vectors[row] = vectors[row]
+
+        # Naive方法将更新的向量先删除
+        if len(clusters) != 0 and len(vectors) != 0:
+            for row in updated_vectors.keys():
+                # 从特定的cluster删除，如果这个vector有cluster
+                if row in vector_to_cluster.keys():
+                    clusters[vector_to_cluster[row]].remove(row)
+
+        for i, v in updated_vectors.items():
+            stream.insert(v, window_num)
+        clusters = stream.cluster()
+        t2 = time.time()
+        print(t2 - t1)
+        time_each_window.append(t2 - t1)
+
+    print("几个vector", len(vectors))
+    num = 0
+    for cluster in clusters:
+        if len(cluster) > 0:
+            num += 1
+            print("几个vector", len(cluster))
+    print("几个cluster", num)
+    return time_each_window, initial_time
+
+
+def DStream_Cluster(windows_updates, vectors, theta, window_num):
     """
     对于每个Streaming vectors，执行完整的Naive插入和删除
     :param windows_updates:
@@ -273,16 +387,5 @@ def DStream(windows_updates, vectors, theta, window_num):
             num += 1
             print("几个vector", len(cluster))
     print("几个cluster", num)
-    return time_each_window, initial_time
-
-
-if __name__ == '__main__':
-    updates_path1 = 'dataset/Reddit'
-    window_size1 = 3
-    windows_update1_1, vectors1 = process_streaming_data(updates_path1, window_size1)
-    theta = 30.0
-    window_num = 200
-
-    time_reddit_size1_dstream, initial_time = DStream(windows_update1_1, vectors1, theta, window_num)
-    print(time_reddit_size1_dstream)
-    print(initial_time + sum(time_reddit_size1_dstream))
+    vectors_dstream, clusters_dstream = extract_torch_vectors_and_clusters_from_dstream(stream, vectors)
+    return vectors_dstream, clusters_dstream
